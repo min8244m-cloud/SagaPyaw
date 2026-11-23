@@ -824,6 +824,37 @@
     return fullBuffer.buffer;
   }
 
+  // စာပိုဒ်ရှည်များကို BERT 508 token limit မကျော်စေရန် ဝါကျအလိုက် ခွဲပေးသည့် Function
+  function splitSpeechChunks(text, limit = 150) {
+    const units = [];
+    const sentences = text.split(/(?<=[။!?…\n])\s*/);
+    for (const sentence of sentences) {
+      const clauses = sentence.split(/(?<=၊)\s*/);
+      for (let clause of clauses) {
+        clause = clause.trim();
+        while (clause.length > limit) {
+          let cut = clause.lastIndexOf(' ', limit);
+          if (cut <= 0) cut = limit;
+          units.push(clause.slice(0, cut).trim());
+          clause = clause.slice(cut).trim();
+        }
+        if (clause) units.push(clause);
+      }
+    }
+    const pieces = [];
+    let current = '';
+    for (const unit of units) {
+      if (current && (current.length + 1 + unit.length) > limit) {
+        pieces.push(current);
+        current = unit;
+      } else {
+        current = current ? `${current} ${unit}` : unit;
+      }
+    }
+    if (current) pieces.push(current);
+    return pieces.length > 0 ? pieces : [text.slice(0, limit)];
+  }
+
   async function getNaraVoiceSession(voiceId, onProgress) {
     if (loadedSessions.has(voiceId)) return loadedSessions.get(voiceId);
 
@@ -877,14 +908,82 @@
     return loadedSessions.get(voiceId);
   }
 
+  async function synthesizeSinglePiece(handle, pieceText) {
+    if (handle.mode === 'factory') {
+      const synthFn = sagapyawMod.synthesize || handle.session.synthesize?.bind(handle.session);
+      const result = await synthFn(handle.session, pieceText);
+      return result.audio || result.samples || result;
+    }
+
+    const toIdsFn = sagapyawMod.textToIds || sagapyawMod.phonemize || sagapyawMod.frontend;
+    if (!toIdsFn) {
+      throw new Error(`Exports found: [${handle.exportKeys.join(', ')}]`);
+    }
+
+    const rawTokens = toIdsFn(pieceText, handle.voiceJson, handle.tables);
+    let tokenIds = Array.isArray(rawTokens)
+      ? rawTokens
+      : Array.from(rawTokens).map(c => handle.voiceJson.vocab[c]).filter(v => v !== undefined);
+
+    if (tokenIds.length === 0) return new Float32Array(0);
+    if (tokenIds.length > 500) tokenIds = tokenIds.slice(0, 500);
+
+    const centers = handle.voiceJson.centers;
+    let bestIdx = 0;
+    let minDiff = Infinity;
+    centers.forEach((c, i) => {
+      const d = Math.abs(c - tokenIds.length);
+      if (d < minDiff) { minDiff = d; bestIdx = i; }
+    });
+
+    const styleArr = Float32Array.from(handle.voiceJson.styles[bestIdx]);
+    const styleTensor = new window.ort.Tensor('float32', styleArr, [1, styleArr.length]);
+    const fullTokens = BigInt64Array.from([0n, ...tokenIds.map(t => BigInt(t)), 0n]);
+    const tokensTensor = new window.ort.Tensor('int64', fullTokens, [1, fullTokens.length]);
+
+    const encOut = await handle.encSess.run({ tokens: tokensTensor, style: styleTensor });
+    const durations = encOut.durations.data;
+    const prosody = encOut.prosody;
+    const encText = encOut.text;
+
+    const totalFrames = Array.from(durations).reduce((a, b) => a + Number(b), 0);
+    const pDim = prosody.dims[1];
+    const tDim = encText.dims[1];
+    const repProsody = new Float32Array(pDim * totalFrames);
+    const repText = new Float32Array(tDim * totalFrames);
+
+    let framePtr = 0;
+    for (let tok = 0; tok < durations.length; tok++) {
+      const dur = Number(durations[tok]);
+      for (let f = 0; f < dur; f++) {
+        for (let d = 0; d < pDim; d++) {
+          repProsody[d * totalFrames + framePtr] = prosody.data[d * durations.length + tok];
+        }
+        for (let d = 0; d < tDim; d++) {
+          repText[d * totalFrames + framePtr] = encText.data[d * durations.length + tok];
+        }
+        framePtr++;
+      }
+    }
+
+    const decOut = await handle.decSess.run({
+      prosody: new window.ort.Tensor('float32', repProsody, [1, pDim, totalFrames]),
+      text: new window.ort.Tensor('float32', repText, [1, tDim, totalFrames]),
+      style: styleTensor
+    });
+
+    const outKey = Object.keys(decOut)[0];
+    return decOut[outKey].data;
+  }
+
   function float32ToWavBlob(samples, sampleRate = 24000) {
     const buffer = new ArrayBuffer(44 + samples.length * 2);
     const view = new DataView(buffer);
     const writeStr = (off, s) => { for (let i = 0; i < s.length; i++) view.setUint8(off + i, s.charCodeAt(i)); };
     writeStr(0, 'RIFF');
     view.setUint32(4, 36 + samples.length * 2, true);
-    view.setUint32(8, 'WAVE', true);
-    view.setUint32(12, 'fmt ', true);
+    view.setUint32(8, 'WAVE');
+    view.setUint32(12, 'fmt ');
     view.setUint32(16, 16, true);
     view.setUint16(20, 1, true);
     view.setUint16(22, 1, true);
@@ -908,78 +1007,38 @@
     },
     synthesizeToWav: async (text, voiceId, onStatus) => {
       const handle = await getNaraVoiceSession(voiceId, onStatus);
-      if (onStatus) onStatus(`🎙️ ${voiceId} အသံထုတ်ပေးနေသည်...`);
+      const pieces = splitSpeechChunks(text, 150);
+      const audioChunks = [];
+      let totalLen = 0;
 
-      if (handle.mode === 'factory') {
-        const synthFn = sagapyawMod.synthesize || handle.session.synthesize?.bind(handle.session);
-        const result = await synthFn(handle.session, text);
-        const samples = result.audio || result.samples || result;
-        const sr = result.sampleRate || 24000;
-        const blob = float32ToWavBlob(samples, sr);
-        const url = URL.createObjectURL(blob);
-        const durationSec = (samples.length / sr).toFixed(1);
-        return { blob, url, durationSec, voiceId };
-      }
-
-      const toIdsFn = sagapyawMod.textToIds || sagapyawMod.phonemize || sagapyawMod.frontend;
-      if (!toIdsFn) {
-        throw new Error(`Exports found: [${handle.exportKeys.join(', ')}]`);
-      }
-
-      const rawTokens = toIdsFn(text, handle.voiceJson, handle.tables);
-      const tokenIds = Array.isArray(rawTokens)
-        ? rawTokens
-        : Array.from(rawTokens).map(c => handle.voiceJson.vocab[c]).filter(v => v !== undefined);
-
-      const centers = handle.voiceJson.centers;
-      let bestIdx = 0;
-      let minDiff = Infinity;
-      centers.forEach((c, i) => {
-        const d = Math.abs(c - tokenIds.length);
-        if (d < minDiff) { minDiff = d; bestIdx = i; }
-      });
-
-      const styleArr = Float32Array.from(handle.voiceJson.styles[bestIdx]);
-      const styleTensor = new window.ort.Tensor('float32', styleArr, [1, styleArr.length]);
-      const fullTokens = BigInt64Array.from([0n, ...tokenIds.map(t => BigInt(t)), 0n]);
-      const tokensTensor = new window.ort.Tensor('int64', fullTokens, [1, fullTokens.length]);
-
-      const encOut = await handle.encSess.run({ tokens: tokensTensor, style: styleTensor });
-      const durations = encOut.durations.data;
-      const prosody = encOut.prosody;
-      const encText = encOut.text;
-
-      const totalFrames = Array.from(durations).reduce((a, b) => a + Number(b), 0);
-      const pDim = prosody.dims[1];
-      const tDim = encText.dims[1];
-      const repProsody = new Float32Array(pDim * totalFrames);
-      const repText = new Float32Array(tDim * totalFrames);
-
-      let framePtr = 0;
-      for (let tok = 0; tok < durations.length; tok++) {
-        const dur = Number(durations[tok]);
-        for (let f = 0; f < dur; f++) {
-          for (let d = 0; d < pDim; d++) {
-            repProsody[d * totalFrames + framePtr] = prosody.data[d * durations.length + tok];
+      for (let i = 0; i < pieces.length; i++) {
+        if (onStatus) {
+          onStatus(`🎙️ ${voiceId} ဖတ်နေသည် (${i + 1}/${pieces.length})...`);
+        }
+        const chunkSamples = await synthesizeSinglePiece(handle, pieces[i]);
+        if (chunkSamples && chunkSamples.length > 0) {
+          if (audioChunks.length > 0) {
+            const pause = new Float32Array(4800);
+            audioChunks.push(pause);
+            totalLen += pause.length;
           }
-          for (let d = 0; d < tDim; d++) {
-            repText[d * totalFrames + framePtr] = encText.data[d * durations.length + tok];
-          }
-          framePtr++;
+          audioChunks.push(chunkSamples);
+          totalLen += chunkSamples.length;
         }
       }
 
-      const decOut = await handle.decSess.run({
-        prosody: new window.ort.Tensor('float32', repProsody, [1, pDim, totalFrames]),
-        text: new window.ort.Tensor('float32', repText, [1, tDim, totalFrames]),
-        style: styleTensor
-      });
+      if (totalLen === 0) throw new Error('အသံထုတ်၍ မရပါ');
 
-      const outKey = Object.keys(decOut)[0];
-      const samples = decOut[outKey].data;
-      const blob = float32ToWavBlob(samples, 24000);
+      const merged = new Float32Array(totalLen);
+      let pos = 0;
+      for (const arr of audioChunks) {
+        merged.set(arr, pos);
+        pos += arr.length;
+      }
+
+      const blob = float32ToWavBlob(merged, 24000);
       const url = URL.createObjectURL(blob);
-      const durationSec = (samples.length / 24000).toFixed(1);
+      const durationSec = (merged.length / 24000).toFixed(1);
       return { blob, url, durationSec, voiceId };
     }
   };
@@ -1970,4 +2029,3 @@ STRICT RULES:
 </script>
 </body>
 </html>
-
