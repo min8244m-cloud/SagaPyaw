@@ -9,8 +9,7 @@
   <title>Myanmar AI Trio Studio × SagaPyaw</title>
 
   <link rel="manifest" href="./manifest.webmanifest">
-  <!-- SagaPyaw Local ONNX Runtime Web -->
-  <script src="./vendor/ort.wasm.bundle.min.mjs" type="module"></script>
+  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.min.js"></script>
 
   <style>
     :root {
@@ -558,11 +557,11 @@
 <div class="sub-bar">
   <div class="status-line" id="status-text">🎙️ SagaPyaw Nara TTS အသင့်ပြင်နေသည်...</div>
   <select class="level-pill" id="top-voice-select" onchange="changeVoiceQuick(this.value)" title="Nara အသံရွေးရန်">
-    <option value="auto">🎭 AI ၃ ဦး အသံခွဲ</option>
     <option value="shoon">🎙️ Shoon</option>
     <option value="thazin">🎙️ Thazin</option>
     <option value="ko-banyar">🎙️ Ko Banyar</option>
     <option value="htet-myat">🎙️ Htet Myat</option>
+    <option value="auto">🎭 AI ၃ ဦး အသံခွဲ</option>
   </select>
   <select class="level-pill" id="top-style-select" onchange="changeStyleQuick(this.value)" title="ဆွေးနွေးပုံစံ">
     <option value="harmonious">🤝 ညှိနှိုင်း</option>
@@ -681,11 +680,11 @@
     <div class="field">
       <label>🎙️ Nara-Mini-v1 အသံ ရွေးချယ်ရန် (Browser Offline)</label>
       <select id="set-nara-voice">
-        <option value="auto">🎭 AI ၃ ဦး အသံခွဲ (Gemini=Shoon, DeepSeek=Ko Banyar, Groq=Thazin)</option>
         <option value="shoon">Shoon (ရွှန်း - 181 MB တစ်ခါသာဒေါင်းရမည်)</option>
         <option value="thazin">Thazin (သဇင် - 181 MB)</option>
         <option value="ko-banyar">Ko Banyar (ကိုဗညား - 181 MB)</option>
         <option value="htet-myat">Htet Myat (ထက်မြတ် - 181 MB)</option>
+        <option value="auto">🎭 AI ၃ ဦး အသံခွဲ (Gemini=Shoon, DeepSeek=Ko Banyar, Groq=Thazin)</option>
       </select>
     </div>
 
@@ -753,20 +752,82 @@
   </div>
 </div>
 
+<!-- Unregister old Service Worker so updates load immediately -->
+<script>
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.getRegistrations().then(regs => {
+      for (let reg of regs) reg.unregister();
+    });
+  }
+</script>
+
 <!-- SagaPyaw Browser ONNX Module Bridge -->
 <script type="module">
-  import { createSession, synthesize } from '../dist/sagapyaw.mjs';
-  import { ensureVoice, readVoice } from './model-store.js';
+  let sagapyawMod = null;
+  let distBase = '../dist';
 
+  try {
+    sagapyawMod = await import('../dist/sagapyaw.mjs');
+    distBase = '../dist';
+  } catch (e1) {
+    try {
+      sagapyawMod = await import('./dist/sagapyaw.mjs');
+      distBase = './dist';
+    } catch (e2) {
+      alert('❌ dist/sagapyaw.mjs ဖိုင် ရှာမတွေ့ပါ! GitHub ထဲတွင် dist ဖိုဒါ ရှိမရှိ စစ်ဆေးပါ။');
+      throw e2;
+    }
+  }
+
+  const { createSession, synthesize } = sagapyawMod;
   const HF_REPO = 'https://huggingface.co/YeeNyunn/nara-mini-v1/resolve/main';
   const loadedSessions = new Map();
   let tablesCache = null;
 
   async function getTables() {
     if (tablesCache) return tablesCache;
-    const res = await fetch('../dist/tables.json');
+    const res = await fetch(`${distBase}/tables.json`);
     tablesCache = await res.json();
     return tablesCache;
+  }
+
+  async function fetchWithCacheAndProgress(url, label, onProgress) {
+    const cache = await caches.open('nara-v1-models');
+    const cachedRes = await cache.match(url);
+    if (cachedRes) return await cachedRes.arrayBuffer();
+
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`Download failed (${res.status}): ${label}`);
+
+    const total = Number(res.headers.get('content-length')) || 0;
+    const reader = res.body.getReader();
+    const chunks = [];
+    let received = 0;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      received += value.length;
+      if (onProgress && total > 0) {
+        const pct = Math.round((received / total) * 100);
+        const mb = (received / (1024 * 1024)).toFixed(1);
+        onProgress(`⬇️ ${label}: ${pct}% (${mb} MB)`);
+      }
+    }
+
+    const fullBuffer = new Uint8Array(received);
+    let offset = 0;
+    for (const chunk of chunks) {
+      fullBuffer.set(chunk, offset);
+      offset += chunk.length;
+    }
+
+    await cache.put(url, new Response(fullBuffer.buffer, {
+      headers: { 'Content-Type': 'application/octet-stream' }
+    }));
+
+    return fullBuffer.buffer;
   }
 
   async function getNaraVoiceSession(voiceId, onProgress) {
@@ -774,28 +835,20 @@
 
     const ort = window.ort;
     if (!ort) throw new Error('ONNX Runtime မတွေ့ပါ');
-    ort.env.wasm.wasmPaths = './vendor/';
 
     const tables = await getTables();
+    const baseUrl = `${HF_REPO}/onnx/${voiceId}`;
 
-    // Check IndexedDB cache or download from HuggingFace (181MB once)
-    await ensureVoice(voiceId, {
-      baseUrl: `${HF_REPO}/onnx/${voiceId}`,
-      onProgress: (loaded, total) => {
-        if (onProgress && total) {
-          const pct = Math.round((loaded / total) * 100);
-          onProgress(`⏳ ${voiceId} အသံ Model ဒေါင်းနေသည် (${pct}%)...`);
-        }
-      }
-    });
+    const voiceBuf = await fetchWithCacheAndProgress(`${baseUrl}/voice.json`, `${voiceId} config`, onProgress);
+    const encoderBuf = await fetchWithCacheAndProgress(`${baseUrl}/encoder.onnx`, `${voiceId} Encoder (78MB)`, onProgress);
+    const decoderBuf = await fetchWithCacheAndProgress(`${baseUrl}/decoder.onnx`, `${voiceId} Decoder (112MB)`, onProgress);
 
     if (onProgress) onProgress(`⚙️ ${voiceId} ONNX Engine ဖွင့်နေသည်...`);
-    const files = await readVoice(voiceId);
     const session = await createSession({
       ort,
-      encoder: files.encoder,
-      decoder: files.decoder,
-      voiceJson: JSON.parse(new TextDecoder().decode(files.voice)),
+      encoder: encoderBuf,
+      decoder: decoderBuf,
+      voiceJson: JSON.parse(new TextDecoder().decode(voiceBuf)),
       tables
     });
 
@@ -828,13 +881,13 @@
     return new Blob([buffer], { type: 'audio/wav' });
   }
 
-  // Expose SagaPyaw Nara Synth to main app script
   window.SagaPyawBridge = {
     preloadVoice: async (voiceId, onStatus) => {
       await getNaraVoiceSession(voiceId, onStatus);
     },
     synthesizeToWav: async (text, voiceId, onStatus) => {
       const session = await getNaraVoiceSession(voiceId, onStatus);
+      if (onStatus) onStatus(`🎙️ ${voiceId} အသံထုတ်ပေးနေသည်...`);
       const result = await synthesize(session, text);
       const blob = float32ToWavBlob(result.audio, result.sampleRate || 24000);
       const url = URL.createObjectURL(blob);
@@ -847,7 +900,6 @@
 </script>
 
 <script>
-  // --- PWA Setup ---
   let deferredPrompt = null;
   window.addEventListener('beforeinstallprompt', (e) => {
     e.preventDefault();
@@ -992,8 +1044,8 @@
   // =========================================================================
   // 2. NARA AUTO PRE-READ BACKGROUND QUEUE (SagaPyaw In-Browser ONNX)
   // =========================================================================
-  const audioCacheMap = new Map();     // msgId -> { blob, url, durationSec, voiceId }
-  const pendingPromises = new Map();   // msgId -> Promise
+  const audioCacheMap = new Map();
+  const pendingPromises = new Map();
   const ttsQueue = [];
   let isQueueWorkerBusy = false;
 
@@ -1009,7 +1061,6 @@
     return text.replace(/[*#_`~>\[\]()]/g, ' ').replace(/\s+/g, ' ').trim();
   }
 
-  // Enqueue a message so Nara reads it in background while AI continues chatting
   function enqueueNaraPreRead(msgId, role, text) {
     if (audioCacheMap.has(msgId) || pendingPromises.has(msgId)) return;
     const voiceId = resolveVoiceForRole(role);
@@ -1078,19 +1129,24 @@
     if (audioCacheMap.has(msgId)) return audioCacheMap.get(msgId);
     if (pendingPromises.has(msgId)) return await pendingPromises.get(msgId);
 
-    // If not queued yet (e.g. auto-preread was off), prioritize now
     enqueueNaraPreRead(msgId, role, text);
     return await pendingPromises.get(msgId);
   }
 
   async function preloadSelectedNaraVoice() {
     if (!window.SagaPyawBridge) {
-      alert('SagaPyaw Engine စတင်နေဆဲဖြစ်ပါသည်၊ ခဏစောင့်ပါ။');
+      alert('SagaPyaw Engine စတင်နေဆဲဖြစ်ပါသည်၊ စက္ကန့်အနည်းငယ် စောင့်ပါ။');
       return;
     }
     const v = config.naraVoice === 'auto' ? 'shoon' : config.naraVoice;
-    await window.SagaPyawBridge.preloadVoice(v, (msg) => updateStatus(msg));
-    updateStatus(`✅ Nara (${v}) Model အသင့်ဖြစ်ပါပြီ`);
+    try {
+      await window.SagaPyawBridge.preloadVoice(v, (msg) => updateStatus(msg));
+      updateStatus(`✅ Nara (${v}) Model အသင့်ဖြစ်ပါပြီ`);
+      alert(`✅ ${v} အသံ Model ဒေါင်းလုဒ်ဆွဲပြီးပါပြီ! ယခု အသံဖတ်မည် နှိပ်သုံးနိုင်ပါပြီ။`);
+    } catch (e) {
+      updateStatus(`⚠️ Download Error: ${e.message}`);
+      alert(`⚠️ ဒေါင်းလုဒ်မရပါ: ${e.message}`);
+    }
   }
 
   let currentAudioEl = null;
@@ -1119,7 +1175,6 @@
       };
       player.play();
     } catch (e) {
-      // Fallback to Browser TTS if ONNX fails
       const utt = new SpeechSynthesisUtterance(cleanTextForTTS(text));
       utt.lang = 'my-MM';
       window.speechSynthesis.speak(utt);
@@ -1160,7 +1215,7 @@
 
   let config = Object.assign({
     style: 'harmonious',
-    naraVoice: 'auto',
+    naraVoice: 'shoon',
     autoPreRead: 'on',
     gKey: localStorage.getItem('g_key') || '',
     gModel: 'gemini-flash-latest',
@@ -1184,6 +1239,9 @@
     renderCategorySheet();
     document.getElementById('top-style-select').value = config.style;
     document.getElementById('top-voice-select').value = config.naraVoice;
+    if (window.SagaPyawBridge) {
+      updateStatus('🎙️ SagaPyaw Nara-Mini-v1 အသင့်ဖြစ်ပါပြီ');
+    }
     if (sessions.length > 0) loadSession(sessions[0].id);
     else createNewChat(true);
     renderHistoryList();
@@ -1438,7 +1496,6 @@
     session.messages.push({ id: msgId, role, name, text, image, rawBase64, mimeType });
     saveSessions();
 
-    // Automatically pre-synthesize AI response with Nara in background!
     if (role !== 'user' && config.autoPreRead === 'on') {
       enqueueNaraPreRead(msgId, role, text);
     }
@@ -1824,4 +1881,3 @@ STRICT RULES:
 </script>
 </body>
 </html>
-
