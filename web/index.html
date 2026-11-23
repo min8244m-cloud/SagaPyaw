@@ -770,16 +770,10 @@
     sagapyawMod = await import('../dist/sagapyaw.mjs');
     distBase = '../dist';
   } catch (e1) {
-    try {
-      sagapyawMod = await import('./dist/sagapyaw.mjs');
-      distBase = './dist';
-    } catch (e2) {
-      alert('❌ dist/sagapyaw.mjs ဖိုင် ရှာမတွေ့ပါ! GitHub ထဲတွင် dist ဖိုဒါ ရှိမရှိ စစ်ဆေးပါ။');
-      throw e2;
-    }
+    sagapyawMod = await import('./dist/sagapyaw.mjs');
+    distBase = './dist';
   }
 
-  const { createSession, synthesize } = sagapyawMod;
   const HF_REPO = 'https://huggingface.co/YeeNyunn/nara-mini-v1/resolve/main';
   const loadedSessions = new Map();
   let tablesCache = null;
@@ -840,20 +834,47 @@
     const baseUrl = `${HF_REPO}/onnx/${voiceId}`;
 
     const voiceBuf = await fetchWithCacheAndProgress(`${baseUrl}/voice.json`, `${voiceId} config`, onProgress);
-    const encoderBuf = await fetchWithCacheAndProgress(`${baseUrl}/encoder.onnx`, `${voiceId} Encoder (78MB)`, onProgress);
-    const decoderBuf = await fetchWithCacheAndProgress(`${baseUrl}/decoder.onnx`, `${voiceId} Decoder (112MB)`, onProgress);
+    const encoderBuf = await fetchWithCacheAndProgress(`${baseUrl}/encoder.onnx`, `${voiceId} Encoder`, onProgress);
+    const decoderBuf = await fetchWithCacheAndProgress(`${baseUrl}/decoder.onnx`, `${voiceId} Decoder`, onProgress);
 
     if (onProgress) onProgress(`⚙️ ${voiceId} ONNX Engine ဖွင့်နေသည်...`);
-    const session = await createSession({
-      ort,
-      encoder: encoderBuf,
-      decoder: decoderBuf,
-      voiceJson: JSON.parse(new TextDecoder().decode(voiceBuf)),
-      tables
-    });
 
-    loadedSessions.set(voiceId, session);
-    return session;
+    const voiceJson = JSON.parse(new TextDecoder().decode(voiceBuf));
+    const exportKeys = Object.keys(sagapyawMod);
+
+    const factoryFn = sagapyawMod.createSession
+      || sagapyawMod.createSynthesizer
+      || sagapyawMod.loadVoice
+      || sagapyawMod.createEngine
+      || sagapyawMod.init
+      || (typeof sagapyawMod.default === 'function' ? sagapyawMod.default : null);
+
+    if (factoryFn) {
+      const session = await factoryFn({
+        ort,
+        encoder: encoderBuf,
+        decoder: decoderBuf,
+        encoderBytes: encoderBuf,
+        decoderBytes: decoderBuf,
+        voiceJson,
+        voice: voiceJson,
+        tables
+      });
+      loadedSessions.set(voiceId, { mode: 'factory', session });
+      return loadedSessions.get(voiceId);
+    }
+
+    const encSess = await ort.InferenceSession.create(encoderBuf);
+    const decSess = await ort.InferenceSession.create(decoderBuf);
+    loadedSessions.set(voiceId, {
+      mode: 'direct',
+      encSess,
+      decSess,
+      voiceJson,
+      tables,
+      exportKeys
+    });
+    return loadedSessions.get(voiceId);
   }
 
   function float32ToWavBlob(samples, sampleRate = 24000) {
@@ -862,8 +883,8 @@
     const writeStr = (off, s) => { for (let i = 0; i < s.length; i++) view.setUint8(off + i, s.charCodeAt(i)); };
     writeStr(0, 'RIFF');
     view.setUint32(4, 36 + samples.length * 2, true);
-    writeStr(8, 'WAVE');
-    writeStr(12, 'fmt ');
+    view.setUint32(8, 'WAVE', true);
+    view.setUint32(12, 'fmt ', true);
     view.setUint32(16, 16, true);
     view.setUint16(20, 1, true);
     view.setUint16(22, 1, true);
@@ -886,12 +907,79 @@
       await getNaraVoiceSession(voiceId, onStatus);
     },
     synthesizeToWav: async (text, voiceId, onStatus) => {
-      const session = await getNaraVoiceSession(voiceId, onStatus);
+      const handle = await getNaraVoiceSession(voiceId, onStatus);
       if (onStatus) onStatus(`🎙️ ${voiceId} အသံထုတ်ပေးနေသည်...`);
-      const result = await synthesize(session, text);
-      const blob = float32ToWavBlob(result.audio, result.sampleRate || 24000);
+
+      if (handle.mode === 'factory') {
+        const synthFn = sagapyawMod.synthesize || handle.session.synthesize?.bind(handle.session);
+        const result = await synthFn(handle.session, text);
+        const samples = result.audio || result.samples || result;
+        const sr = result.sampleRate || 24000;
+        const blob = float32ToWavBlob(samples, sr);
+        const url = URL.createObjectURL(blob);
+        const durationSec = (samples.length / sr).toFixed(1);
+        return { blob, url, durationSec, voiceId };
+      }
+
+      const toIdsFn = sagapyawMod.textToIds || sagapyawMod.phonemize || sagapyawMod.frontend;
+      if (!toIdsFn) {
+        throw new Error(`Exports found: [${handle.exportKeys.join(', ')}]`);
+      }
+
+      const rawTokens = toIdsFn(text, handle.voiceJson, handle.tables);
+      const tokenIds = Array.isArray(rawTokens)
+        ? rawTokens
+        : Array.from(rawTokens).map(c => handle.voiceJson.vocab[c]).filter(v => v !== undefined);
+
+      const centers = handle.voiceJson.centers;
+      let bestIdx = 0;
+      let minDiff = Infinity;
+      centers.forEach((c, i) => {
+        const d = Math.abs(c - tokenIds.length);
+        if (d < minDiff) { minDiff = d; bestIdx = i; }
+      });
+
+      const styleArr = Float32Array.from(handle.voiceJson.styles[bestIdx]);
+      const styleTensor = new window.ort.Tensor('float32', styleArr, [1, styleArr.length]);
+      const fullTokens = BigInt64Array.from([0n, ...tokenIds.map(t => BigInt(t)), 0n]);
+      const tokensTensor = new window.ort.Tensor('int64', fullTokens, [1, fullTokens.length]);
+
+      const encOut = await handle.encSess.run({ tokens: tokensTensor, style: styleTensor });
+      const durations = encOut.durations.data;
+      const prosody = encOut.prosody;
+      const encText = encOut.text;
+
+      const totalFrames = Array.from(durations).reduce((a, b) => a + Number(b), 0);
+      const pDim = prosody.dims[1];
+      const tDim = encText.dims[1];
+      const repProsody = new Float32Array(pDim * totalFrames);
+      const repText = new Float32Array(tDim * totalFrames);
+
+      let framePtr = 0;
+      for (let tok = 0; tok < durations.length; tok++) {
+        const dur = Number(durations[tok]);
+        for (let f = 0; f < dur; f++) {
+          for (let d = 0; d < pDim; d++) {
+            repProsody[d * totalFrames + framePtr] = prosody.data[d * durations.length + tok];
+          }
+          for (let d = 0; d < tDim; d++) {
+            repText[d * totalFrames + framePtr] = encText.data[d * durations.length + tok];
+          }
+          framePtr++;
+        }
+      }
+
+      const decOut = await handle.decSess.run({
+        prosody: new window.ort.Tensor('float32', repProsody, [1, pDim, totalFrames]),
+        text: new window.ort.Tensor('float32', repText, [1, tDim, totalFrames]),
+        style: styleTensor
+      });
+
+      const outKey = Object.keys(decOut)[0];
+      const samples = decOut[outKey].data;
+      const blob = float32ToWavBlob(samples, 24000);
       const url = URL.createObjectURL(blob);
-      const durationSec = (result.audio.length / (result.sampleRate || 24000)).toFixed(1);
+      const durationSec = (samples.length / 24000).toFixed(1);
       return { blob, url, durationSec, voiceId };
     }
   };
@@ -1142,10 +1230,10 @@
     try {
       await window.SagaPyawBridge.preloadVoice(v, (msg) => updateStatus(msg));
       updateStatus(`✅ Nara (${v}) Model အသင့်ဖြစ်ပါပြီ`);
-      alert(`✅ ${v} အသံ Model ဒေါင်းလုဒ်ဆွဲပြီးပါပြီ! ယခု အသံဖတ်မည် နှိပ်သုံးနိုင်ပါပြီ။`);
+      alert(`✅ ${v} အသံ Model အသင့်ဖြစ်ပါပြီ! ယခု အသံဖတ်မည် နှိပ်သုံးနိုင်ပါပြီ။`);
     } catch (e) {
       updateStatus(`⚠️ Download Error: ${e.message}`);
-      alert(`⚠️ ဒေါင်းလုဒ်မရပါ: ${e.message}`);
+      alert(`⚠️ မရပါ: ${e.message}`);
     }
   }
 
@@ -1175,6 +1263,7 @@
       };
       player.play();
     } catch (e) {
+      alert(`⚠️ Nara အသံထုတ်မရပါ: ${e.message}`);
       const utt = new SpeechSynthesisUtterance(cleanTextForTTS(text));
       utt.lang = 'my-MM';
       window.speechSynthesis.speak(utt);
@@ -1881,3 +1970,4 @@ STRICT RULES:
 </script>
 </body>
 </html>
+
