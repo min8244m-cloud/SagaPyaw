@@ -824,7 +824,6 @@
     return fullBuffer.buffer;
   }
 
-  // စာပိုဒ်ရှည်များကို BERT 508 token limit မကျော်စေရန် ဝါကျအလိုက် ခွဲပေးသည့် Function
   function splitSpeechChunks(text, limit = 150) {
     const units = [];
     const sentences = text.split(/(?<=[။!?…\n])\s*/);
@@ -908,11 +907,52 @@
     return loadedSessions.get(voiceId);
   }
 
+  // မည်သည့် Output ပုံစံမဆို Float32Array PCM samples အစစ်သို့ ပြောင်းပေးမည့် Function
+  async function extractFloat32Samples(rawResult) {
+    if (!rawResult) return new Float32Array(0);
+
+    // 1. Blob ဖြစ်နေပါက ArrayBuffer ပြောင်းမည်
+    if (rawResult instanceof Blob) {
+      rawResult = await rawResult.arrayBuffer();
+    }
+
+    // 2. Object ဖြစ်နေပါက အတွင်းထဲက audio/pcm/wav/samples/data ကို ရှာမည်
+    if (typeof rawResult === 'object' && !(rawResult instanceof Float32Array) && !(rawResult instanceof Uint8Array) && !(rawResult instanceof Int16Array) && !(rawResult instanceof ArrayBuffer)) {
+      const inner = rawResult.audio || rawResult.pcm || rawResult.samples || rawResult.wav || rawResult.data || Object.values(rawResult).find(v => v && (v.length > 100 || v.byteLength > 100 || v instanceof Blob));
+      if (inner) return await extractFloat32Samples(inner);
+    }
+
+    // 3. WAV Header ("RIFF") ပါပြီးသား Uint8Array / ArrayBuffer ဖြစ်နေပါက 44-byte header ဖြုတ်ပြီး PCM ယူမည်
+    const bytes = rawResult instanceof ArrayBuffer ? new Uint8Array(rawResult) : (rawResult instanceof Uint8Array ? rawResult : null);
+    if (bytes && bytes.length > 44 && bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46) {
+      const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      const numSamples = Math.floor((bytes.byteLength - 44) / 2);
+      const f32 = new Float32Array(numSamples);
+      for (let i = 0; i < numSamples; i++) {
+        f32[i] = view.getInt16(44 + i * 2, true) / 32768.0;
+      }
+      return f32;
+    }
+
+    // 4. Int16Array ဖြစ်နေပါက Float32 ပြောင်းမည်
+    if (rawResult instanceof Int16Array) {
+      const f32 = new Float32Array(rawResult.length);
+      for (let i = 0; i < rawResult.length; i++) f32[i] = rawResult[i] / 32768.0;
+      return f32;
+    }
+
+    // 5. Float32Array (သို့) Array ဖြစ်နေပါက တိုက်ရိုက်ယူမည်
+    if (rawResult instanceof Float32Array) return rawResult;
+    if (Array.isArray(rawResult)) return Float32Array.from(rawResult);
+
+    return new Float32Array(0);
+  }
+
   async function synthesizeSinglePiece(handle, pieceText) {
     if (handle.mode === 'factory') {
       const synthFn = sagapyawMod.synthesize || handle.session.synthesize?.bind(handle.session);
       const result = await synthFn(handle.session, pieceText);
-      return result.audio || result.samples || result;
+      return await extractFloat32Samples(result);
     }
 
     const toIdsFn = sagapyawMod.textToIds || sagapyawMod.phonemize || sagapyawMod.frontend;
@@ -1045,6 +1085,7 @@
 
   window.dispatchEvent(new Event('sagapyaw-ready'));
 </script>
+
 
 <script>
   let deferredPrompt = null;
